@@ -1,24 +1,19 @@
-import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { query } from '../db.js';
+import { authenticateStaffCredentials } from '../services/staffAuthService.js';
+import {
+  AUTH_COOKIE_NAME,
+  AUTH_TOKEN_EXPIRES_IN,
+  buildStaffSessionClearCookieOptions,
+  buildStaffSessionCookieOptions,
+  logStaffAuthEvent,
+  summarizeStaffAuthRequest,
+  summarizeSetCookieHeaders,
+  summarizeStaffSessionCookieOptions,
+} from '../utils/staffAuthSession.js';
 
-const isProduction = process.env.NODE_ENV === 'production';
-const requestedSameSite = (process.env.COOKIE_SAMESITE || '').toLowerCase();
-const cookieSameSite = ['lax', 'strict', 'none'].includes(requestedSameSite)
-  ? requestedSameSite
-  : isProduction
-    ? 'none'
-    : 'lax';
-const cookieSecure =
-  process.env.COOKIE_SECURE === 'true' ||
-  cookieSameSite === 'none' ||
-  isProduction;
-
-const cookieOptions = {
-  httpOnly: true,
-  sameSite: cookieSameSite,
-  secure: cookieSecure,
-};
+const cookieOptions = buildStaffSessionCookieOptions();
+const clearCookieOptions = buildStaffSessionClearCookieOptions();
+const cookieSummary = summarizeStaffSessionCookieOptions(cookieOptions);
 
 export async function login(req, res) {
   try {
@@ -28,51 +23,30 @@ export async function login(req, res) {
       return res.status(400).json({ ok: false, error: 'Missing credentials' });
     }
 
-    const { rows } = await query(
-      `
-        SELECT id, username, display_name, password_hash, is_active, role_id
-        FROM staff_users
-        WHERE username = $1
-        LIMIT 1
-      `,
-      [username]
-    );
+    const authResult = await authenticateStaffCredentials({
+      username,
+      password,
+      recordAudit: true,
+    });
 
-    const user = rows[0];
-    const passwordOk = user ? await bcrypt.compare(password, user.password_hash) : false;
-
-    if (!user || !user.is_active || !passwordOk) {
-      if (user) {
-        await query(
-          `
-            UPDATE staff_users
-            SET failed_login_count = failed_login_count + 1,
-                updated_at = now()
-            WHERE id = $1
-          `,
-          [user.id]
-        );
-      }
-
+    if (!authResult.ok || !authResult.user) {
       return res.status(401).json({ ok: false, error: 'Invalid credentials' });
     }
 
-    await query(
-      `
-        UPDATE staff_users
-        SET failed_login_count = 0,
-            last_login_at = now(),
-            updated_at = now()
-        WHERE id = $1
-      `,
-      [user.id]
-    );
+    const user = authResult.user;
 
     const token = jwt.sign({ sub: user.id }, process.env.JWT_SECRET, {
-      expiresIn: '7d',
+      expiresIn: AUTH_TOKEN_EXPIRES_IN,
     });
 
-    res.cookie('token', token, cookieOptions);
+    res.cookie(AUTH_COOKIE_NAME, token, cookieOptions);
+    logStaffAuthEvent('login_success', {
+      ...summarizeStaffAuthRequest(req),
+      userId: user.id,
+      username: user.username,
+      cookie: cookieSummary,
+      ...summarizeSetCookieHeaders(res.getHeader('Set-Cookie')),
+    });
     return res.json({
       ok: true,
       data: {
@@ -82,15 +56,26 @@ export async function login(req, res) {
       },
     });
   } catch (error) {
+    logStaffAuthEvent('login_failed_internal', {
+      ...summarizeStaffAuthRequest(req),
+      attemptedUsername: typeof req.body?.username === 'string' ? req.body.username.trim() || null : null,
+      errorName: error?.name || null,
+      errorMessage: error?.message || null,
+    });
     return res.status(500).json({ ok: false, error: 'Server error' });
   }
 }
 
 export function me(req, res) {
+  logStaffAuthEvent('auth_me_success', {
+    ...summarizeStaffAuthRequest(req),
+    userId: req.user?.id || null,
+    username: req.user?.username || null,
+  });
   return res.json({ ok: true, data: req.user });
 }
 
 export function logout(req, res) {
-  res.clearCookie('token', cookieOptions);
+  res.clearCookie(AUTH_COOKIE_NAME, clearCookieOptions);
   return res.json({ ok: true, data: { message: 'Logged out' } });
 }
